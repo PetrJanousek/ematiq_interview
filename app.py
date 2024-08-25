@@ -51,66 +51,76 @@ class HeartbeatException(Exception):
     pass
 
 
-def truncate_float(number, length):
+def truncate_float(number: float, length: int):
     """Truncate float numbers, up to the number specified
     in length that must be an integer.
     - Copied from SO
     """
 
-    number = number * pow(10, length)
-    number = int(number)
-    number = float(number)
-    number /= pow(10, length)
+    res: float = number * pow(10, length)
+    res = int(res)
+    res = float(res)
+    res /= pow(10, length)
     return number
 
 
 class Timer:
+    """Simple timer that times the exact sleep duration so time drifting doesn't occur."""
+
     def __init__(self, interval: int):
-        self.interval = interval
-        self.start_time = time.monotonic()
+        self.interval: int = interval
+        self.start_time: float = time.monotonic()
 
     def duration(self) -> float:
         return self.interval - ((time.monotonic() - self.start_time) % self.interval)
 
 
 class Connection:
+    """Handles connection to specified websocket and it's handling."""
+
     def __init__(self, uri: str):
         self.uri: str = uri
         self.ws: Optional[WebSocketClientProtocol] = None
 
     async def establish_connection(self):
+        """Establishes connection to websocket"""
         log.debug(f"Trying to connect to {self.uri}")
         self.ws = await websockets.connect(self.uri)
         log.info(f"New connection established")
 
-    async def send_message(self, message: dict) -> None:
+    async def send_message(self, message: dict | Message) -> None:
+        """Sends message through websocket it's connected to"""
         if self.ws:
             log.debug(f"Sending message: {message}")
             await self.ws.send(json.dumps(message))
 
     async def receive_messages(self) -> AsyncGenerator[Data, None]:
+        """Starts receiving messages and yields them out"""
         if self.ws:
             async for message in self.ws:
                 log.debug(f"Received message: {message!r}")
                 yield message
 
     async def close(self) -> None:
+        """Closes the websocket if any connection exists"""
         if self.ws:
             await self.ws.close()
 
     async def is_closed(self) -> bool:
+        """Checks if connection exists"""
         if self.ws:
             return self.ws.closed
         return False
 
 
 class AppContext:
+    """Provides context for the running app and handling all related logic."""
 
     def __init__(
         self, connection: Connection, historical_rates_base: str, live_rates_url: str
     ):
         self.queue: asyncio.Queue[Message] = asyncio.Queue()
-        self.last_heartbeat = 0.0
+        self.last_heartbeat: float = 0.0
         self.exchange_rates: Rates = {}
         self.connection: Connection = connection
         self.historical_rates_base: str = historical_rates_base
@@ -125,8 +135,8 @@ class AppContext:
             while True:
                 try:
                     await self.connection.establish_connection()
-                    recv_task = asyncio.create_task(self.receiver())
-                    heartbeat_task = asyncio.create_task(self.heartbeat())
+                    recv_task: asyncio.Task = asyncio.create_task(self.receiver())
+                    heartbeat_task: asyncio.Task = asyncio.create_task(self.heartbeat())
 
                     await asyncio.gather(recv_task, heartbeat_task)
                 except HeartbeatException:
@@ -142,7 +152,6 @@ class AppContext:
                     log.info("finished cancelling recv_task")
                 except OSError:
                     log.error("Error trying to connect, will retry")
-                    await asyncio.sleep(2)
                 finally:
                     await self.connection.close()
                     log.warning("Closed the connection")
@@ -156,7 +165,7 @@ class AppContext:
         On limit breach raises Exception"""
         log.info("Starting heartbeat check")
         self.last_heartbeat = time.time()
-        timer = Timer(HEARTBEAT_INTERVAL)
+        timer: Timer = Timer(HEARTBEAT_INTERVAL)
         while True:
             if time.time() - self.last_heartbeat >= HEARTBEAT_LIMIT:
                 log.info("Heartbeat missed, closing connection...")
@@ -189,7 +198,7 @@ class AppContext:
                         f"Unsupported message type: {msg['type']} received, ignoring"
                     )
 
-    async def process_message(self, message) -> None:
+    async def process_message(self, message: Message) -> None:
         """Processes incoming message and sends response"""
         log.debug("Processing new message")
         try:
@@ -224,7 +233,7 @@ class AppContext:
         except Exception as e:
             log.info(f"Something went wrong with processing message: {e}")
 
-    async def ensure_rates_for_date(self, date) -> None:
+    async def ensure_rates_for_date(self, date: str) -> None:
         """Check if rates for date are cached, if not request it"""
 
         if not date in self.exchange_rates:
@@ -253,11 +262,13 @@ class AppContext:
 
     async def request_live_exchange_rates_periodically(self) -> None:
         """Periodically requests exchange rates via api call"""
-        timer = Timer(EXCHANGE_RATE_UPDATE_INTERVAL)
+        timer: Timer = Timer(EXCHANGE_RATE_UPDATE_INTERVAL)
         while True:
             try:
-                rates = await request_exchange_rates(self.live_rates_url)
-                current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+                rates: dict[str, float] = await request_exchange_rates(
+                    self.live_rates_url
+                )
+                current_date: str = datetime.datetime.now().strftime("%Y-%m-%d")
                 self.exchange_rates[current_date] = rates
                 log.debug("Newest exchange rates updated")
                 await asyncio.sleep(timer.duration())
@@ -269,6 +280,8 @@ class AppContext:
 async def request_exchange_rates(
     url: str, date: Optional[str] = None
 ) -> dict[str, float]:
+    """Requests newest exchange rates from provided api,
+    optionally requests historical rates"""
     if date:
         url = f"{url}&date={date}"
     async with aiohttp.ClientSession() as session:
@@ -277,7 +290,7 @@ async def request_exchange_rates(
     raise Exception("Unable to get response")
 
 
-def create_error_message(message_id: str, error_str: str) -> dict[str, str]:
+def create_error_message(message_id: int, error_str: str) -> dict[str, str | int]:
     """Creates dict with error message"""
 
     return {
@@ -290,10 +303,9 @@ def create_error_message(message_id: str, error_str: str) -> dict[str, str]:
 async def main():
 
     historical_rates_api_key = os.getenv("EXCHANGERATE_API_KEY", None)
-    live_rates_api_key = os.getenv("FREECURRENCY_API_KEY", None)
 
-    if not historical_rates_api_key or not live_rates_api_key:
-        log.info("Unable to get api keys, shutting down application")
+    if not historical_rates_api_key:
+        log.info("Unable to get api key, shutting down application")
         return
 
     historical_url_base = f"https://api.exchangerate.host/historical?access_key={historical_rates_api_key}&source=EUR"
