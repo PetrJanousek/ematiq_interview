@@ -21,7 +21,6 @@ log.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# log.getLogger("websockets.server").setLevel(log.ERROR)
 log.getLogger("websockets").setLevel(log.ERROR)
 
 HEARTBEAT_LIMIT: int = 2
@@ -300,19 +299,13 @@ async def main():
     historical_url_base = f"https://api.exchangerate.host/historical?access_key={historical_rates_api_key}&source=EUR"
     live_rates_url = f"https://api.exchangerate.host/live?access_key={historical_rates_api_key}&source=EUR"
 
-    # conn = Connection("ws://localhost:8765")
     conn = Connection("wss://currency-assignment.ematiq.com")
     ctx = AppContext(conn, historical_url_base, live_rates_url)
 
-    # ctx = AppContext("wss://currency-assignment.ematiq.com")
     try:
         await ctx.run()
     finally:
         log.info("App shutted down")
-        # TODO: Delete later
-        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-        for task in tasks:
-            log.info(task)
 
 
 if __name__ == "__main__":
