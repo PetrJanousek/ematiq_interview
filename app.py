@@ -2,7 +2,7 @@ import asyncio
 from contextlib import suppress
 import datetime
 import json
-from typing import Optional, AsyncGenerator, TypedDict
+from typing import Optional, AsyncGenerator, Set, TypedDict
 import aiohttp
 import time
 import websockets
@@ -108,9 +108,7 @@ class Connection:
 
     async def is_closed(self) -> bool:
         """Checks if connection exists"""
-        if self.ws:
-            return self.ws.closed
-        return False
+        return self.ws.closed if self.ws else True
 
 
 class AppContext:
@@ -125,40 +123,47 @@ class AppContext:
         self.connection: Connection = connection
         self.historical_rates_base: str = historical_rates_base
         self.live_rates_url: str = live_rates_url
+        self.active_tasks: Set[asyncio.Task] = set()
 
     async def run(self):
-        """App's main loop, handling all logic"""
         try:
-            asyncio.create_task(self.message_handler())
-            asyncio.create_task(self.request_live_exchange_rates_periodically())
+            tasks = [
+                asyncio.create_task(self.message_handler()),
+                asyncio.create_task(self.request_live_exchange_rates_periodically()),
+                asyncio.create_task(self.manage_connection()),
+            ]
+            await asyncio.gather(*tasks)
 
-            while True:
-                try:
-                    await self.connection.establish_connection()
-                    recv_task: asyncio.Task = asyncio.create_task(self.receiver())
-                    heartbeat_task: asyncio.Task = asyncio.create_task(self.heartbeat())
-
-                    await asyncio.gather(recv_task, heartbeat_task)
-                except HeartbeatException:
-                    log.warning(
-                        "Restarting websocket connection on heartbeat limit reached"
+        except asyncio.CancelledError:
+            log.info("Run cancelled error")
+        except Exception as e:
+            log.error(f"Unexpected error in run: {e}")
+        finally:
+            for task in tasks:
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await asyncio.gather(*tasks)
+                if self.active_tasks:
+                    log.info(
+                        f"Waiting for {len(self.active_tasks)} active tasks to complete..."
                     )
-                    with suppress(asyncio.CancelledError):
-                        log.debug("cancelling recv_task")
-                        recv_task.cancel()
-                        if recv_task:
-                            # Ensure it is not unbound
-                            await recv_task
-                    log.info("finished cancelling recv_task")
-                except OSError:
-                    log.error("Error trying to connect, will retry")
-                finally:
-                    await self.connection.close()
-                    log.warning("Closed the connection")
+                    await asyncio.gather(*self.active_tasks)
+            log.info("Run shutting down")
 
-        except:
-            await self.connection.close()
-            log.info("Run is shutting down")
+    async def manage_connection(self):
+        while True:
+            try:
+                await self.connection.establish_connection()
+                await asyncio.gather(self.receiver(), self.heartbeat())
+            except HeartbeatException:
+                log.warning(
+                    "Restarting websocket connection on heartbeat limit reached"
+                )
+            except OSError:
+                log.error("Error trying to connect, will retry")
+            finally:
+                await self.connection.close()
+                log.warning("Closed the connection")
 
     async def heartbeat(self) -> bool:
         """Checks heartbeat limit and sends heartbeat to the other side.
@@ -168,7 +173,6 @@ class AppContext:
         timer: Timer = Timer(HEARTBEAT_INTERVAL)
         while True:
             if time.time() - self.last_heartbeat >= HEARTBEAT_LIMIT:
-                log.info("Heartbeat missed, closing connection...")
                 raise HeartbeatException
             await self.connection.send_message({"type": "heartbeat"})
             await asyncio.sleep(timer.duration())
@@ -176,11 +180,11 @@ class AppContext:
     async def receiver(self) -> None:
         """Receives messages from connection and puts it into queue"""
         log.info("Starting to listen to new messages")
-        if not self.connection:
-            return
         async for message in self.connection.receive_messages():
             m: Message = json.loads(message)
-            asyncio.create_task(self.queue.put(m))
+            task = asyncio.create_task(self.queue.put(m))
+            self.active_tasks.add(task)
+            task.add_done_callback(self.active_tasks.discard)
 
     async def message_handler(self) -> None:
         """Retrieves message from queue and handles it"""
@@ -192,7 +196,9 @@ class AppContext:
                     self.last_heartbeat = time.time()
                     log.info("Received heartbeat")
                 case "message":
-                    asyncio.create_task(self.process_message(msg))
+                    task = asyncio.create_task(self.process_message(msg))
+                    self.active_tasks.add(task)
+                    task.add_done_callback(self.active_tasks.discard)
                 case _:
                     log.warning(
                         f"Unsupported message type: {msg['type']} received, ignoring"
@@ -287,7 +293,6 @@ async def request_exchange_rates(
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             return (await response.json())["quotes"]
-    raise Exception("Unable to get response")
 
 
 def create_error_message(message_id: int, error_str: str) -> dict[str, str | int]:
@@ -312,6 +317,7 @@ async def main():
     live_rates_url = f"https://api.exchangerate.host/live?access_key={historical_rates_api_key}&source=EUR"
 
     conn = Connection("wss://currency-assignment.ematiq.com")
+    # conn = Connection("ws://localhost:8765")
     ctx = AppContext(conn, historical_url_base, live_rates_url)
 
     try:
